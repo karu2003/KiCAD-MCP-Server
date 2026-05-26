@@ -56,6 +56,41 @@ All notable changes to the KiCAD MCP Server project are documented here.
   silently falling back to `(0, 0)`. Added 7 regression tests reproducing
   the failure on a real-world user schematic.
 
+### New Features
+
+- **KiCad 10 `.kicad_symdir` per-symbol directory library support**: Symbol
+  discovery (`search_symbols`, `list_symbol_libraries`, `get_symbol_info`)
+  now finds symbols in KiCad 10's new directory-based library format where
+  each symbol is a separate `.kicad_sym` file within a `.kicad_symdir`
+  directory. `add_schematic_component` correctly resolves and injects both
+  classic single-file `.kicad_sym` libraries and new `.kicad_symdir`
+  libraries, handling quoted URI paths in `sym-lib-table` with spaces
+  (e.g. `"C:/Program Files/..."`).
+
+- **Component rotation and mirroring**: `add_schematic_component` now accepts
+  `angle` (rotation in degrees, CCW) and `mirrorY` (horizontal flip)
+  parameters for correct placement of components in rotated or mirrored
+  orientations. Automatically extracts component property positions
+  (Reference, Value) from library definitions and applies rotation
+  transforms to place them correctly relative to the rotated symbol.
+
+- **Windows dialog auto-dismissal**: On Windows, a background daemon thread
+  using pywin32 monitors KiCad windows and auto-clicks "Yes"/"Ja"/"OK"
+  confirmation dialogs that appear during schematic reloads. This allows
+  interactive schematic modifications via `add_schematic_component` to
+  proceed without blocking on user confirmation popups. Non-blocking and
+  graceful; disables silently if pywin32 unavailable or on non-Windows
+  platforms. Works for both SWIG file-based backend and IPC (running
+  KiCad instance) backend.
+
+- **Auto-upgrade projects to current KiCad format**: `create_project` now
+  uses `kicad-cli` to automatically upgrade newly-created schematic and
+  board files to the current KiCad format. Ensures new projects have all
+  KiCad 10+ features available. Searches common installation paths on
+  Windows, Linux, and macOS; falls back gracefully if `kicad-cli` not
+  found. Both SWIG and IPC backends benefit from consistently formatted
+  project files.
+
 ### New MCP Tools
 
 - `add_gnd_stitching_vias` — Drop GND stitching vias across the board with
