@@ -468,6 +468,8 @@ class KiCADInterface:
             "add_schematic_text": self._handle_add_schematic_text,
             "list_schematic_texts": self._handle_list_schematic_texts,
             "add_sheet_pin": self._handle_add_sheet_pin,
+            "add_hierarchical_sheet": self._handle_add_hierarchical_sheet,
+            "create_hierarchical_subsheet": self._handle_create_hierarchical_subsheet,
             "import_svg_logo": self._handle_import_svg_logo,
             # UI/Process management commands
             "get_backend_state": self._handle_get_backend_state,
@@ -4082,6 +4084,110 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error adding sheet pin: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    @staticmethod
+    def _coerce_xy(value: Any, default: List[float], keys: Tuple[str, str]) -> List[float]:
+        """Accept {x,y}/{width,height} dicts or [a, b] lists; fall back to default."""
+        if isinstance(value, dict):
+            return [value.get(keys[0], default[0]), value.get(keys[1], default[1])]
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            return [value[0], value[1]]
+        return list(default)
+
+    def _handle_add_hierarchical_sheet(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Insert a hierarchical-sheet reference block into a parent schematic,
+        pointing at an existing sub-sheet file."""
+        logger.info("Adding hierarchical sheet to schematic")
+        try:
+            from commands.wire_manager import WireManager
+
+            parent_path = params.get("schematicPath")
+            subsheet_path = params.get("subsheetPath")
+            if not parent_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not subsheet_path:
+                return {"success": False, "message": "subsheetPath is required"}
+
+            sheet_name = params.get("sheetName", "Sheet")
+            position = self._coerce_xy(params.get("position"), [50.0, 50.0], ("x", "y"))
+            size = self._coerce_xy(params.get("size"), [80.0, 50.0], ("width", "height"))
+            project_name = params.get("projectName")
+
+            success, sheet_uuid, message = WireManager.add_hierarchical_sheet(
+                Path(parent_path),
+                Path(subsheet_path),
+                sheet_name=sheet_name,
+                position=position,
+                size=size,
+                project_name=project_name,
+            )
+            return {
+                "success": success,
+                "message": message,
+                "sheet_uuid": sheet_uuid,
+                "sheet_name": sheet_name,
+            }
+        except Exception as e:
+            logger.error(f"Error adding hierarchical sheet: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_create_hierarchical_subsheet(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a clean sub-sheet .kicad_sch file and link it into a parent
+        schematic in a single call (create + add_hierarchical_sheet)."""
+        logger.info("Creating hierarchical sub-sheet")
+        try:
+            from commands.wire_manager import WireManager
+
+            parent_path = params.get("parentSchematicPath") or params.get("schematicPath")
+            subsheet_path = params.get("subsheetPath")
+            if not parent_path:
+                return {"success": False, "message": "parentSchematicPath is required"}
+            if not subsheet_path:
+                return {"success": False, "message": "subsheetPath is required"}
+
+            parent = Path(parent_path)
+            subsheet = Path(subsheet_path)
+            if not parent.exists():
+                return {"success": False, "message": f"Parent schematic not found: {parent}"}
+
+            sheet_name = params.get("sheetName", "Sheet")
+            position = self._coerce_xy(params.get("position"), [50.0, 50.0], ("x", "y"))
+            size = self._coerce_xy(params.get("size"), [80.0, 50.0], ("width", "height"))
+            project_name = params.get("projectName")
+
+            # Match the parent's file format version so KiCad does not warn.
+            with open(parent, "r", encoding="utf-8") as f:
+                parent_content = f.read()
+            version = WireManager._extract_sch_version(parent_content)
+
+            subsheet.parent.mkdir(parents=True, exist_ok=True)
+            file_uuid = WireManager.create_clean_subsheet(subsheet, version=version)
+
+            success, sheet_uuid, message = WireManager.add_hierarchical_sheet(
+                parent,
+                subsheet,
+                sheet_name=sheet_name,
+                position=position,
+                size=size,
+                project_name=project_name,
+            )
+            return {
+                "success": success,
+                "message": message,
+                "subsheet_path": str(subsheet),
+                "subsheet_uuid": file_uuid,
+                "sheet_uuid": sheet_uuid,
+                "sheet_name": sheet_name,
+            }
+        except Exception as e:
+            logger.error(f"Error creating hierarchical sub-sheet: {e}")
             import traceback
 
             logger.error(traceback.format_exc())

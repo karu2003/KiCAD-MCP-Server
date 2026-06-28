@@ -8,6 +8,7 @@ manipulate the .kicad_sch file directly.
 
 import logging
 import math
+import os
 import re
 import tempfile
 import uuid
@@ -1157,6 +1158,157 @@ class WireManager:
             i += 1
 
         return content, False
+
+    # ------------------------------------------------------------------
+    # Hierarchical sheet support
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_root_uuid(content: str) -> Optional[str]:
+        """Return the top-level (uuid ...) of a .kicad_sch file."""
+        m = re.search(r"\(uuid\s+\"?([0-9a-fA-F-]{36})\"?\s*\)", content)
+        return m.group(1) if m else None
+
+    @staticmethod
+    def _extract_sch_version(content: str) -> str:
+        """Return the (version N) token of a .kicad_sch file (default KiCad 10)."""
+        m = re.search(r"\(version\s+(\d+)\)", content)
+        return m.group(1) if m else "20260306"
+
+    @staticmethod
+    def create_clean_subsheet(subsheet_path: Path, version: str = "20260306") -> str:
+        """Write a clean, empty KiCad sub-sheet file. Returns its file uuid."""
+        file_uuid = str(uuid.uuid4())
+        content = (
+            "(kicad_sch\n"
+            f"\t(version {version})\n"
+            '\t(generator "eeschema")\n'
+            '\t(generator_version "10.0")\n'
+            f'\t(uuid "{file_uuid}")\n'
+            '\t(paper "A4")\n'
+            "\t(lib_symbols)\n"
+            "\t(sheet_instances\n"
+            '\t\t(path "/"\n'
+            '\t\t\t(page "1")\n'
+            "\t\t)\n"
+            "\t)\n"
+            "\t(embedded_fonts no)\n"
+            ")\n"
+        )
+        with open(subsheet_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return file_uuid
+
+    @staticmethod
+    def _make_sheet_block_text(
+        sheet_name: str,
+        sheet_file: str,
+        position: List[float],
+        size: List[float],
+        root_uuid: str,
+        project_name: str,
+        page: str = "2",
+        sheet_uuid: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        """Build a hierarchical (sheet ...) block (KiCad 9/10 format).
+
+        Returns (block_text, sheet_uuid).
+        """
+        if sheet_uuid is None:
+            sheet_uuid = str(uuid.uuid4())
+        x, y = position[0], position[1]
+        w, h = size[0], size[1]
+        name_y = y - 0.5
+        file_y = y + h + 1.0
+        block = (
+            "\t(sheet\n"
+            f"\t\t(at {x} {y})\n"
+            f"\t\t(size {w} {h})\n"
+            "\t\t(exclude_from_sim no)\n"
+            "\t\t(in_bom yes)\n"
+            "\t\t(on_board yes)\n"
+            "\t\t(dnp no)\n"
+            "\t\t(fields_autoplaced yes)\n"
+            "\t\t(stroke\n\t\t\t(width 0.1524)\n\t\t\t(type solid)\n\t\t)\n"
+            "\t\t(fill\n\t\t\t(color 0 0 0 0.0000)\n\t\t)\n"
+            f'\t\t(uuid "{sheet_uuid}")\n'
+            f'\t\t(property "Sheetname" "{sheet_name}"\n'
+            f"\t\t\t(at {x} {name_y} 0)\n"
+            "\t\t\t(effects\n\t\t\t\t(font\n\t\t\t\t\t(size 1.27 1.27)\n\t\t\t\t)\n"
+            "\t\t\t\t(justify left bottom)\n\t\t\t)\n"
+            "\t\t)\n"
+            f'\t\t(property "Sheetfile" "{sheet_file}"\n'
+            f"\t\t\t(at {x} {file_y} 0)\n"
+            "\t\t\t(effects\n\t\t\t\t(font\n\t\t\t\t\t(size 1.27 1.27)\n\t\t\t\t)\n"
+            "\t\t\t\t(justify left top)\n\t\t\t)\n"
+            "\t\t)\n"
+            "\t\t(instances\n"
+            f'\t\t\t(project "{project_name}"\n'
+            f'\t\t\t\t(path "/{root_uuid}"\n'
+            f'\t\t\t\t\t(page "{page}")\n'
+            "\t\t\t\t)\n"
+            "\t\t\t)\n"
+            "\t\t)\n"
+            "\t)\n"
+        )
+        return block, sheet_uuid
+
+    @staticmethod
+    def add_hierarchical_sheet(
+        parent_path: Path,
+        subsheet_path: Path,
+        sheet_name: str = "Sheet",
+        position: Optional[List[float]] = None,
+        size: Optional[List[float]] = None,
+        project_name: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str], str]:
+        """Insert a hierarchical-sheet reference block into the parent schematic,
+        pointing at an existing sub-sheet file.
+
+        Returns (success, sheet_uuid, message).
+        """
+        parent_path = Path(parent_path)
+        subsheet_path = Path(subsheet_path)
+        position = position or [50.0, 50.0]
+        size = size or [80.0, 50.0]
+
+        if not parent_path.exists():
+            return False, None, f"Parent schematic not found: {parent_path}"
+
+        with open(parent_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        root_uuid = WireManager._extract_root_uuid(content)
+        if not root_uuid:
+            return False, None, "Could not find root uuid in parent schematic"
+
+        if project_name is None:
+            project_name = parent_path.stem
+
+        try:
+            sheet_file = os.path.relpath(subsheet_path, parent_path.parent)
+        except Exception:
+            sheet_file = subsheet_path.name
+        sheet_file = sheet_file.replace("\\", "/")
+
+        # Root sheet is page 1; each existing (sheet) block consumes one page.
+        existing = len(re.findall(r"^\t\(sheet\b", content, re.MULTILINE))
+        page = str(existing + 2)
+
+        block, sheet_uuid = WireManager._make_sheet_block_text(
+            sheet_name, sheet_file, position, size, root_uuid, project_name, page
+        )
+
+        insert_at = _find_insertion_point(content)
+        new_content = content[:insert_at] + block + content[insert_at:]
+        with open(parent_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+
+        logger.info(
+            f"Added hierarchical sheet '{sheet_name}' -> {sheet_file} "
+            f"(uuid={sheet_uuid}, page={page})"
+        )
+        return True, sheet_uuid, f"Added hierarchical sheet '{sheet_name}' (page {page})"
 
 
 if __name__ == "__main__":

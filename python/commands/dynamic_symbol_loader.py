@@ -38,14 +38,29 @@ class DynamicSymbolLoader:
         possible_paths = [
             Path("/usr/share/kicad/symbols"),
             Path("/usr/local/share/kicad/symbols"),
-            Path("C:/Program Files/KiCad/9.0/share/kicad/symbols"),
-            Path("C:/Program Files/KiCad/8.0/share/kicad/symbols"),
             Path("/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols"),
-            Path.home() / ".local" / "share" / "kicad" / "10.0" / "symbols",
-            Path.home() / ".local" / "share" / "kicad" / "9.0" / "symbols",
-            Path.home() / "Documents" / "KiCad" / "10.0" / "3rdparty" / "symbols",
-            Path.home() / "Documents" / "KiCad" / "9.0" / "3rdparty" / "symbols",
         ]
+
+        # Windows / Linux versioned installs — discover any installed KiCad
+        # version dynamically (newest first) instead of hard-coding 8.0/9.0.
+        # This is what made 'Device:R' fail on KiCad 10: the bundled symbol
+        # directory was never in the search list.
+        for program_files in (
+            Path("C:/Program Files/KiCad"),
+            Path("C:/Program Files (x86)/KiCad"),
+        ):
+            if program_files.is_dir():
+                for ver_dir in sorted(program_files.iterdir(), reverse=True):
+                    possible_paths.append(ver_dir / "share" / "kicad" / "symbols")
+
+        for ver in ("10.0", "9.0", "8.0"):
+            possible_paths.append(
+                Path.home() / ".local" / "share" / "kicad" / ver / "symbols"
+            )
+            possible_paths.append(
+                Path.home() / "Documents" / "KiCad" / ver / "3rdparty" / "symbols"
+            )
+
         for env_var in [
             "KICAD10_SYMBOL_DIR",
             "KICAD9_SYMBOL_DIR",
@@ -55,7 +70,14 @@ class DynamicSymbolLoader:
             if env_var in os.environ:
                 possible_paths.insert(0, Path(os.environ[env_var]))
 
-        return [p for p in possible_paths if p.exists() and p.is_dir()]
+        # De-duplicate while preserving order.
+        seen = set()
+        result = []
+        for p in possible_paths:
+            if p.exists() and p.is_dir() and p not in seen:
+                seen.add(p)
+                result.append(p)
+        return result
 
     def find_library_file(self, library_name: str) -> Optional[Path]:
         """Find the .kicad_sym file for a given library name.
@@ -441,17 +463,30 @@ class DynamicSymbolLoader:
         x: float = 0,
         y: float = 0,
         unit: int = 1,
+        angle: float = 0,
+        mirror_y: bool = False,
+        project_name: str = "project",
+        instance_path: str = "/",
     ) -> bool:
         """
         Add a component instance to the schematic.
         This creates the (symbol ...) block with lib_id reference.
         For multi-unit symbols, set unit to 1–N to place a specific unit.
+
+        Args:
+            angle: Rotation in degrees (KiCad CCW).
+            mirror_y: Mirror horizontally (flip left-right).
+            project_name: Project name written into the instance path (matches
+                          the .kicad_pro stem so ERC/annotation resolve).
+            instance_path: Hierarchical sheet path for the instance. "/" for the
+                           root sheet, "/<sheet_uuid>" for a sub-sheet.
         """
         full_lib_id = f"{library_name}:{symbol_name}"
         new_uuid = str(uuid.uuid4())
+        mirror_line = "    (mirror y)\n" if mirror_y else ""
 
-        instance_block = f"""  (symbol (lib_id "{full_lib_id}") (at {x} {y} 0) (unit {unit})
-    (in_bom yes) (on_board yes) (dnp no)
+        instance_block = f"""  (symbol (lib_id "{full_lib_id}") (at {x} {y} {angle}) (unit {unit})
+{mirror_line}    (in_bom yes) (on_board yes) (dnp no)
     (uuid "{new_uuid}")
     (property "Reference" "{reference}" (at {x} {y - 2.54} 0)
       (effects (font (size 1.27 1.27)))
@@ -466,8 +501,8 @@ class DynamicSymbolLoader:
       (effects (font (size 1.27 1.27)) (hide yes))
     )
     (instances
-      (project "project"
-        (path "/"
+      (project "{project_name}"
+        (path "{instance_path}"
           (reference "{reference}")
           (unit {unit})
         )
@@ -541,7 +576,11 @@ class DynamicSymbolLoader:
         x: float = 0,
         y: float = 0,
         unit: int = 1,
+        angle: float = 0,
+        mirror_y: bool = False,
         project_path: Optional[Path] = None,
+        project_name: Optional[str] = None,
+        instance_path: Optional[str] = None,
     ) -> bool:
         """
         High-level: ensure symbol definition exists in schematic, then add an instance.
@@ -549,11 +588,30 @@ class DynamicSymbolLoader:
 
         Args:
             unit: For multi-unit symbols, which unit to place (1=A, 2=B, …). Default 1.
+            angle: Rotation in degrees (KiCad CCW).
+            mirror_y: Mirror horizontally (flip left-right).
             project_path: Optional project directory. When set, project-specific
                           sym-lib-table is also searched for the library file.
+            project_name: Project name for the instance path (defaults to the
+                          .kicad_pro stem, then "project").
+            instance_path: Hierarchical sheet path. Auto-resolved from the parent
+                           schematic's sheet block when not provided.
         """
         if project_path:
             self.project_path = project_path
+
+        # Resolve the hierarchical instance path / project name when not supplied,
+        # so components placed on a sub-sheet annotate under the correct sheet
+        # instance (not the root "/").
+        if project_name is None or instance_path is None:
+            resolved_proj, resolved_path = self._resolve_sheet_instance(
+                Path(schematic_path), self.project_path
+            )
+            if project_name is None:
+                project_name = resolved_proj
+            if instance_path is None:
+                instance_path = resolved_path
+
         # Ensure symbol definition is in lib_symbols
         self.inject_symbol_into_schematic(schematic_path, library_name, symbol_name)
 
@@ -568,7 +626,68 @@ class DynamicSymbolLoader:
             x=x,
             y=y,
             unit=unit,
+            angle=angle,
+            mirror_y=mirror_y,
+            project_name=project_name,
+            instance_path=instance_path,
         )
+
+    @staticmethod
+    def _resolve_sheet_instance(
+        schematic_path: Path, project_path: Optional[Path]
+    ) -> "tuple[str, str]":
+        """Return (project_name, instance_path) for a schematic file.
+
+        - Root sheet  -> ("<proj>", "/")
+        - Sub-sheet    -> ("<proj>", "/<sheet_block_uuid>") where the uuid is read
+          from the parent sheet block whose Sheetfile matches this file.
+        Only single-level hierarchy is resolved; deeper nesting falls back to "/".
+        """
+        import re as _re
+
+        schematic_path = Path(schematic_path)
+        search_dir = Path(project_path) if project_path else schematic_path.parent
+
+        # Project name from the .kicad_pro stem when available.
+        project_name = "project"
+        pros = list(search_dir.glob("*.kicad_pro"))
+        if pros:
+            project_name = pros[0].stem
+
+        # Find a parent .kicad_sch that references this file via a (sheet ...) block.
+        target = schematic_path.name
+        for sch in search_dir.glob("*.kicad_sch"):
+            if sch.resolve() == schematic_path.resolve():
+                continue
+            try:
+                content = sch.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            # Locate each (sheet ...) block and check its Sheetfile property.
+            for m in _re.finditer(r"\(sheet\b", content):
+                start = m.start()
+                depth = 0
+                end = start
+                for i in range(start, len(content)):
+                    if content[i] == "(":
+                        depth += 1
+                    elif content[i] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            end = i
+                            break
+                block = content[start : end + 1]
+                fm = _re.search(r'\(property\s+"Sheetfile"\s+"([^"]+)"', block)
+                if fm and Path(fm.group(1)).name == target:
+                    um = _re.search(
+                        r'\(uuid\s+"?([0-9a-fA-F-]{36})"?\s*\)', block
+                    )
+                    pm = _re.search(r'\(project\s+"([^"]+)"', block)
+                    if pm:
+                        project_name = pm.group(1)
+                    if um:
+                        return project_name, f"/{um.group(1)}"
+        return project_name, "/"
 
 
 if __name__ == "__main__":
