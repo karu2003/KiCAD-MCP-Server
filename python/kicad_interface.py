@@ -432,6 +432,7 @@ class KiCADInterface:
             "add_schematic_wire": self._handle_add_schematic_wire,
             "add_schematic_net_label": self._handle_add_schematic_net_label,
             "add_no_connect": self._handle_add_no_connect,
+            "batch_connect": self._handle_batch_connect,
             "connect_to_net": self._handle_connect_to_net,
             "connect_passthrough": self._handle_connect_passthrough,
             "get_schematic_pin_locations": self._handle_get_schematic_pin_locations,
@@ -2585,6 +2586,87 @@ class KiCADInterface:
                 "message": str(e),
                 "errorDetails": traceback.format_exc(),
             }
+
+    def _handle_batch_connect(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Place net labels on many pins in one call.
+
+        connections: {reference: {pin: netName}} where pin is a number or name.
+        Each pin endpoint is located via PinLocator and a label is placed there,
+        giving label-based connectivity. Optional labelType (default 'label';
+        use 'global_label' / 'hierarchical_label' for whole map).
+        """
+        logger.info("Batch connecting pins via net labels")
+        try:
+            from pathlib import Path
+
+            from commands.pin_locator import PinLocator
+            from commands.wire_manager import WireManager
+
+            schematic_path = params.get("schematicPath")
+            connections = params.get("connections")
+            label_type = params.get("labelType", "label")
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not isinstance(connections, dict) or not connections:
+                return {
+                    "success": False,
+                    "message": "connections must be a non-empty map {ref: {pin: net}}",
+                }
+
+            sch = Path(schematic_path)
+            if not sch.exists():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+            locator = PinLocator()
+            placed: List[Dict[str, Any]] = []
+            errors: List[str] = []
+
+            for ref, pin_map in connections.items():
+                if not isinstance(pin_map, dict):
+                    errors.append(f"{ref}: pin map must be an object {{pin: net}}")
+                    continue
+                for pin, net in pin_map.items():
+                    try:
+                        pin_loc = locator.get_pin_location(sch, ref, str(pin))
+                        if pin_loc is None:
+                            errors.append(f"{ref}.{pin}: pin not found")
+                            continue
+                        ok = WireManager.add_label(
+                            sch, str(net), pin_loc, label_type=label_type, orientation=0
+                        )
+                        if ok:
+                            placed.append(
+                                {
+                                    "ref": ref,
+                                    "pin": str(pin),
+                                    "net": str(net),
+                                    "position": pin_loc,
+                                }
+                            )
+                        else:
+                            errors.append(f"{ref}.{pin}: failed to add label")
+                    except Exception as e:  # noqa: BLE001
+                        errors.append(f"{ref}.{pin}: {e}")
+
+            self._reload_kicad_schematic()
+
+            return {
+                "success": len(errors) == 0,
+                "placed_count": len(placed),
+                "placed": placed,
+                "errors": errors,
+                "message": (
+                    f"Placed {len(placed)} net labels"
+                    + (f", {len(errors)} errors" if errors else "")
+                ),
+            }
+        except Exception as e:
+            logger.error(f"Error in batch_connect: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
 
     def _handle_add_no_connect(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Add a no-connect flag (X marker) to an unconnected pin in the schematic."""
